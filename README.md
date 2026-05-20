@@ -1,14 +1,21 @@
 # ChurnLoop Kotlin SDK
 
+[![Maven Central](https://img.shields.io/maven-central/v/io.churnloop/churnloop-sdk-kotlin)](https://central.sonatype.com/artifact/io.churnloop/churnloop-sdk-kotlin)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Android](https://img.shields.io/badge/Android-API%2024%2B-green)](https://developer.android.com)
+[![JVM](https://img.shields.io/badge/JVM-11%2B-orange)](https://kotlinlang.org)
+
 Official Kotlin SDK for the [ChurnLoop](https://churnloop.com) analytics + intervention platform.
 
 - Pure JVM Kotlin — works on Android (API 24+) and any server-side JVM (Ktor, Spring, etc.)
 - Single runtime dependency: `kotlinx-coroutines-core`
 - Built-in HTTP via `HttpURLConnection` (no OkHttp dependency — keeps Android binary size down)
-- Coroutines-first API (suspendable `close()`); Java-callable too
+- Coroutines-first API (suspending `close()`); `closeBlocking()` available for Java and non-suspending teardown
+- Batching with size + time + flush triggers
+- Exponential-backoff retry on transient failures
 - Inbound-webhook signature verification helper included
 
-> **Status:** v0.1.0. `track()` works end-to-end with auto-attached context + canonical event vocabulary + webhook verification. Batching, retry with backoff, and the rest of the Segment surface (`identify` / `page` / `screen`) land in v0.2.
+> **Status:** v0.2.0. `track()`, `identify()`, `page()`, `screen()`, batching, exponential-backoff retry, and webhook verification all work end-to-end.
 
 ---
 
@@ -22,7 +29,8 @@ Official Kotlin SDK for the [ChurnLoop](https://churnloop.com) analytics + inter
 - [Android lifecycle integration](#android-lifecycle-integration)
 - [Privacy & consent](#privacy--consent)
 - [Error handling](#error-handling)
-- [Current limitations (v0.1.0)](#current-limitations-v010)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
 - [License](#license)
 
 ---
@@ -33,7 +41,7 @@ Official Kotlin SDK for the [ChurnLoop](https://churnloop.com) analytics + inter
 
 ```kotlin
 dependencies {
-    implementation("io.churnloop:churnloop-sdk-kotlin:0.1.0")
+    implementation("io.churnloop:churnloop-sdk-kotlin:0.2.0")
 }
 ```
 
@@ -41,7 +49,7 @@ dependencies {
 
 ```groovy
 dependencies {
-    implementation 'io.churnloop:churnloop-sdk-kotlin:0.1.0'
+    implementation 'io.churnloop:churnloop-sdk-kotlin:0.2.0'
 }
 ```
 
@@ -97,8 +105,11 @@ val options = ChurnLoopOptions(
     host = "https://ingest.churnloop.com",              // default
     timeoutMs = 30_000,
     disabled = false,
+    flushAt = 100,           // flush when queue reaches this many events
+    flushInterval = 1_000L,  // flush if events sit longer than this (ms)
+    maxQueueSize = 1_000,    // drop oldest when exceeded
+    maxRetries = 5,          // retry retryable failures with backoff
     onError = { error, droppedCount ->
-        // Route to your crash reporter / structured logger.
         Timber.w(error, "ChurnLoop send failed (dropped: $droppedCount)")
     },
 )
@@ -179,11 +190,30 @@ when (result) {
 
 `WebhookVerify.verify(...)` never throws — failures are returned as `VerifyResult.Invalid(reason)`.
 
+### Ktor route example
+
+```kotlin
+routing {
+    post("/webhooks/churnloop") {
+        val rawBody = call.receiveText()
+        val sig = call.request.headers["X-ChurnLoop-Signature"] ?: ""
+        val result = WebhookVerify.verify(rawBody, sig, System.getenv("CHURNLOOP_WEBHOOK_SECRET"))
+        when (result) {
+            is VerifyResult.Valid -> {
+                // handle
+                call.respond(HttpStatusCode.OK)
+            }
+            is VerifyResult.Invalid -> call.respond(HttpStatusCode.Forbidden)
+        }
+    }
+}
+```
+
 ---
 
 ## Android lifecycle integration
 
-Hold one `ChurnLoop` instance per app process — typically in a `@HiltSingleton` / DI provider. Wire `close()` into your app's process-shutdown so the in-flight sends drain:
+Hold one `ChurnLoop` instance per app process — typically in a `@Singleton` / DI provider. Wire `closeBlocking()` into your app's process-shutdown so the in-flight sends drain:
 
 ```kotlin
 @Singleton
@@ -253,25 +283,31 @@ val options = ChurnLoopOptions(
 
 Errors the SDK reports:
 
-| Cause | Reported via | Retryable in v0.2? |
+| Cause | Reported via | Retryable? |
 |---|---|---|
 | Missing `event` or `userId` | `onError` (dropped locally) | No (caller bug) |
 | Invalid API key (401) | `onError` | No |
 | Insufficient permissions or quota exceeded (403) | `onError` | No |
 | Validation failure on the server (400) | `onError` | No |
-| Rate-limited (429) | `onError` (dropped in v0.1) | Yes (in v0.2) |
-| 5xx / network failure | `onError` (dropped in v0.1) | Yes (in v0.2) |
+| Rate-limited (429) | `onError` after retries exhausted | Yes (exponential backoff) |
+| 5xx / network failure | `onError` after retries exhausted | Yes (exponential backoff) |
 
 ---
 
-## Current limitations (v0.1.0)
+## Roadmap
 
-- **No batching** — every `track()` is one HTTP request.
-- **No retry** — failures drop the event. v0.2 adds exponential backoff.
-- **No `identify` / `page` / `screen` yet** — coming in v0.2.
-- **No `flushPending()`** — only full `close()` available, which disposes the scope.
-- **No persisted queue** — events lost on app kill before `close()`.
-- **No Android-specific device fields** in `$context` yet — coming in a future `@churnloop/sdk-android` companion package.
+| Version | Adds |
+|---|---|
+| **v0.1.0** | `track()`, `StandardEvent`, `$context`, webhook verification |
+| **v0.2.0** *(current)* | `identify`, `page`, `screen`; batching (size + time + shutdown); exponential-backoff retry; queue overflow drop policy; `closeBlocking()` |
+| **v0.3.0** | Persisted queue (survives process kill); Android-specific device fields in `$context` |
+| **v1.0.0** | Public API frozen; SemVer guarantees |
+
+---
+
+## Contributing
+
+Issues and PRs welcome at [github.com/ChurnLoop/sdk-kotlin](https://github.com/ChurnLoop/sdk-kotlin/issues).
 
 ---
 
